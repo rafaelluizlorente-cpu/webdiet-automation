@@ -27,8 +27,16 @@ app.post("/agendar", async (req, res) => {
     horaFimWebDiet = `${String(fim.getHours()).padStart(2, "0")}:${String(fim.getMinutes()).padStart(2, "0")}`;
   }
 
-  const browser = await chromium.launch({ args: ["--no-sandbox"] });
-  const page = await browser.newPage();
+  const browser = await chromium.launch({
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    headless: true
+  });
+
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 900 }
+  });
+
+  const page = await context.newPage();
 
   try {
     await page.goto("https://pt.webdiet.com.br/login/", { waitUntil: "domcontentloaded" });
@@ -55,20 +63,33 @@ app.post("/agendar", async (req, res) => {
       return res.json({ status: "semana_nao_encontrada", dataBR });
     }
 
+    // Localizar coluna do dia correto
     const headers = await page.locator(".fc-col-header-cell").evaluateAll(els =>
-      els.map(el => { const r = el.getBoundingClientRect(); return { texto: el.innerText, x: r.x, width: r.width }; })
+      els.map(el => {
+        const r = el.getBoundingClientRect();
+        return { texto: el.innerText, x: r.x, width: r.width };
+      })
     );
     const header = headers.find(h => h.texto.includes(dataBR));
 
+    if (!header) {
+      await browser.close();
+      return res.json({ status: "coluna_nao_encontrada", dataBR });
+    }
+
+    // Usar seletor data-time do FullCalendar (funciona para qualquer horário)
     const [hh, mm] = horaCalendly.split(":").map(Number);
+    const dataTimeStr = `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00`;
 
-    // CORREÇÃO DO BUG DAS 20h — usa seletor real do FullCalendar
-    const slotHandle = await page.locator(
-      `.fc-timegrid-slot[data-time="${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00"]`
-    ).first();
+    const slotHandle = page.locator(`.fc-timegrid-slot[data-time="${dataTimeStr}"]`).first();
     const slotBox = await slotHandle.boundingBox();
-    const clickY = slotBox.y + slotBox.height / 2;
 
+    if (!slotBox) {
+      await browser.close();
+      return res.json({ status: "slot_nao_encontrado", dataTimeStr });
+    }
+
+    const clickY = slotBox.y + slotBox.height / 2;
     const pontosX = [
       header.x + header.width / 2,
       header.x + header.width * 0.35,
@@ -80,7 +101,8 @@ app.post("/agendar", async (req, res) => {
       await page.mouse.click(clickX, clickY);
       await page.waitForTimeout(2500);
       modalAbriu = await page.evaluate(() => {
-        const inputs = Array.from(document.querySelectorAll("input")).filter(i => i.offsetParent !== null && i.id !== "inputChat");
+        const inputs = Array.from(document.querySelectorAll("input"))
+          .filter(i => i.offsetParent !== null && i.id !== "inputChat");
         return inputs.length >= 6;
       });
       if (modalAbriu) break;
@@ -88,28 +110,49 @@ app.post("/agendar", async (req, res) => {
 
     if (!modalAbriu) {
       await browser.close();
-      return res.json({ status: "modal_nao_abriu", dataBR, horaCalendly });
+      return res.json({ status: "modal_nao_abriu", dataBR, horaCalendly, slotBox });
     }
 
+    // Preencher nome
     const campos = page.locator('input:visible:not(#inputChat)');
     await campos.nth(0).fill(nome);
+    await page.waitForTimeout(500);
+
+    // Clicar no dropdown DDI customizado e selecionar Brasil
+    await page.locator('div[class*="ddi"], select[name*="ddi"], .ddi-select, [data-field*="ddi"]').first().click().catch(() => {});
+    await page.waitForTimeout(500);
+
+    // Tentar clicar em Brasil na lista dropdown
+    const brasilOption = page.locator('text="Brasil (+55)"').first();
+    const brasilExists = await brasilOption.count();
+    if (brasilExists > 0) {
+      await brasilOption.click();
+      await page.waitForTimeout(500);
+    } else {
+      // Fallback: tentar via select nativo
+      await page.evaluate(() => {
+        const selects = Array.from(document.querySelectorAll("select"));
+        const selectDDI = selects.find(s =>
+          Array.from(s.options).some(o => o.value === "55" || o.textContent.includes("Brasil"))
+        );
+        if (selectDDI) {
+          selectDDI.value = "55";
+          selectDDI.dispatchEvent(new Event("change", { bubbles: true }));
+          if (window.jQuery) window.jQuery(selectDDI).val("55").trigger("change");
+        }
+      });
+    }
+
+    // Preencher telefone
     await campos.nth(1).fill(telefone);
+    await page.waitForTimeout(500);
+
+    // Preencher horários
     await campos.nth(4).fill(horaInicioWebDiet);
     await campos.nth(5).fill(horaFimWebDiet);
     await page.waitForTimeout(1000);
 
-    await page.evaluate(() => {
-      const selects = Array.from(document.querySelectorAll("select"));
-      const selectDDI = selects.find(s => Array.from(s.options).some(o => o.value === "55" || o.textContent.includes("Brasil")));
-      if (selectDDI) {
-        selectDDI.value = "55";
-        selectDDI.dispatchEvent(new Event("input", { bubbles: true }));
-        selectDDI.dispatchEvent(new Event("change", { bubbles: true }));
-        if (window.jQuery) window.jQuery(selectDDI).val("55").trigger("change");
-      }
-    });
-
-    await page.waitForTimeout(1500);
+    // Salvar
     await page.locator("#agendarBtnAtalho").click();
     await page.waitForTimeout(8000);
 
